@@ -90,3 +90,10 @@ export interface SimulationResult {
   msftRoas: number;
   budgetEfficiency: string;
 }
+
+export interface ConsistencyCheck {
+  id: string;
+  rule: string;
+  status: 'pass' | 'fail' | 'warning';
+  message: string;
+}

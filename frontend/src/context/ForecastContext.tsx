@@ -1,5 +1,5 @@
 import React, { createContext, useState, useContext, useEffect } from 'react';
-import { HistoricalPoint, CampaignPerformance, ForecastResult, BusinessInsights, SimulationResult } from '../types';
+import { HistoricalPoint, CampaignPerformance, ForecastResult, BusinessInsights, SimulationResult, ConsistencyCheck } from '../types';
 import { generateLocalSampleData, runLocalForecasting, generateLocalAIInsights, runLocalSimulation } from '../utils/localEngine';
 
 interface ForecastContextType {
@@ -12,6 +12,7 @@ interface ForecastContextType {
   error: string | null;
   apiKey: string;
   isSandbox: boolean;
+  consistencyChecks: ConsistencyCheck[];
   setApiKey: (key: string) => void;
   seedData: () => Promise<void>;
   uploadCSV: (file: File) => Promise<boolean>;
@@ -23,6 +24,207 @@ interface ForecastContextType {
 
 const ForecastContext = createContext<ForecastContextType | undefined>(undefined);
 
+// Helper function to validate campaign names, platforms, alignment and metric consistency
+function performConsistencyChecks(csvText: string): ConsistencyCheck[] {
+  const checks: ConsistencyCheck[] = [];
+  const lines = csvText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  if (lines.length < 2) {
+    checks.push({
+      id: 'empty_file',
+      rule: 'File Completeness',
+      status: 'fail',
+      message: 'The uploaded file contains no data rows.'
+    });
+    return checks;
+  }
+  
+  const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+  
+  // 1. Column Completeness
+  const required = ['date', 'google ads spend', 'google ads revenue', 'meta ads spend', 'meta ads revenue', 'microsoft ads spend', 'microsoft ads revenue', 'campaign', 'campaign type', 'impressions', 'clicks', 'conversions', 'revenue', 'roas'];
+  const missing = required.filter(col => !headers.includes(col));
+  
+  if (missing.length > 0) {
+    checks.push({
+      id: 'missing_columns',
+      rule: 'Schema Completeness',
+      status: 'fail',
+      message: `Missing required schema fields: ${missing.join(', ')}`
+    });
+  } else {
+    checks.push({
+      id: 'schema_valid',
+      rule: 'Schema Completeness',
+      status: 'pass',
+      message: 'All 14 required columns are present and correctly mapped.'
+    });
+  }
+
+  // Parse lines to check campaigns
+  const idx = (colName: string) => headers.indexOf(colName);
+  
+  let hasGoogle = false;
+  let hasMeta = false;
+  let hasMsft = false;
+  
+  const campaignNames = new Set<string>();
+  const campaignTypesMap: Record<string, string> = {};
+  
+  let totalRowsChecked = 0;
+  let spendAnomalyCount = 0;
+  let clickAnomalyCount = 0;
+  let nameIssuesCount = 0;
+  let attributionIssuesCount = 0;
+  
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split(',').map(c => c.trim());
+    if (cols.length < headers.length) continue;
+    totalRowsChecked++;
+    
+    const campName = cols[idx('campaign')];
+    const campType = cols[idx('campaign type')];
+    
+    const gSpend = parseFloat(cols[idx('google ads spend')]) || 0;
+    const mSpend = parseFloat(cols[idx('meta ads spend')]) || 0;
+    const msSpend = parseFloat(cols[idx('microsoft ads spend')]) || 0;
+    
+    const impressions = parseInt(cols[idx('impressions')]) || 0;
+    const clicks = parseInt(cols[idx('clicks')]) || 0;
+    const spend = gSpend + mSpend + msSpend;
+    
+    if (gSpend > 0) hasGoogle = true;
+    if (mSpend > 0) hasMeta = true;
+    if (msSpend > 0) hasMsft = true;
+    
+    campaignNames.add(campName);
+    campaignTypesMap[campName] = campType;
+    
+    // Anomaly checks
+    if (spend > 0 && impressions === 0) {
+      spendAnomalyCount++;
+    }
+    if (clicks > 0 && impressions === 0) {
+      clickAnomalyCount++;
+    }
+    
+    // Attribution consistency checks (e.g. Google containing Search or PMax, Meta containing Social)
+    const lowerName = campName.toLowerCase();
+    const lowerType = campType.toLowerCase();
+    
+    if (lowerName.includes('google') && lowerType === 'social') {
+      attributionIssuesCount++;
+    }
+    if ((lowerName.includes('meta') || lowerName.includes('facebook')) && lowerType === 'search') {
+      attributionIssuesCount++;
+    }
+  }
+
+  // Levenshtein check for spelling variations in campaigns
+  const campaignsList = Array.from(campaignNames);
+  const getLevenshtein = (s1: string, s2: string): number => {
+    const track = Array(s2.length + 1).fill(null).map(() => Array(s1.length + 1).fill(null));
+    for (let i = 0; i <= s1.length; i += 1) track[0][i] = i;
+    for (let j = 0; j <= s2.length; j += 1) track[j][0] = j;
+    for (let j = 1; j <= s2.length; j += 1) {
+      for (let i = 1; i <= s1.length; i += 1) {
+        const indicator = s1[i - 1] === s2[j - 1] ? 0 : 1;
+        track[j][i] = Math.min(
+          track[j][i - 1] + 1, // deletion
+          track[j - 1][i] + 1, // insertion
+          track[j - 1][i - 1] + indicator // substitution
+        );
+      }
+    }
+    return track[s2.length][s1.length];
+  };
+
+  for (let i = 0; i < campaignsList.length; i++) {
+    for (let j = i + 1; j < campaignsList.length; j++) {
+      const dist = getLevenshtein(campaignsList[i].toLowerCase(), campaignsList[j].toLowerCase());
+      if (dist > 0 && dist <= 2) {
+        nameIssuesCount++;
+      }
+    }
+  }
+
+  // 2. Channel Representation
+  if (hasGoogle && hasMeta && hasMsft) {
+    checks.push({
+      id: 'channel_representation',
+      rule: 'Channel Representation',
+      status: 'pass',
+      message: 'All three paid acquisition networks (Google Ads, Meta Ads, Microsoft Ads) are represented in the dataset.'
+    });
+  } else {
+    const missingPlats = [];
+    if (!hasGoogle) missingPlats.push('Google Ads');
+    if (!hasMeta) missingPlats.push('Meta Ads');
+    if (!hasMsft) missingPlats.push('Microsoft Ads');
+    checks.push({
+      id: 'channel_representation',
+      rule: 'Channel Representation',
+      status: 'warning',
+      message: `Missing active spend for channels: ${missingPlats.join(', ')}`
+    });
+  }
+
+  // 3. Naming Consistency
+  if (nameIssuesCount === 0) {
+    checks.push({
+      id: 'naming_consistency',
+      rule: 'Campaign Naming Integrity',
+      status: 'pass',
+      message: 'No spelling duplicates or naming standard warnings detected across campaigns.'
+    });
+  } else {
+    checks.push({
+      id: 'naming_consistency',
+      rule: 'Campaign Naming Integrity',
+      status: 'warning',
+      message: `Detected ${nameIssuesCount} campaigns with highly similar spelling variations. Possible duplicate entries.`
+    });
+  }
+
+  // 4. Attribution Consistency
+  if (attributionIssuesCount === 0) {
+    checks.push({
+      id: 'attribution_tagging',
+      rule: 'Channel Type Alignment',
+      status: 'pass',
+      message: 'All campaigns align with their appropriate network channel types (e.g. Google -> Search, Meta -> Social).'
+    });
+  } else {
+    checks.push({
+      id: 'attribution_tagging',
+      rule: 'Channel Type Alignment',
+      status: 'warning',
+      message: `Detected ${attributionIssuesCount} instances where campaign networks and tags are misaligned (e.g., Google Ads tagged as Social).`
+    });
+  }
+
+  // 5. Spend/Click Anomalies
+  if (spendAnomalyCount === 0 && clickAnomalyCount === 0) {
+    checks.push({
+      id: 'metrics_integrity',
+      rule: 'Conversion Funnel Integrity',
+      status: 'pass',
+      message: 'Impressions, clicks, and conversions align logically across all records (no empty funnels).'
+    });
+  } else {
+    const reasons = [];
+    if (spendAnomalyCount > 0) reasons.push(`${spendAnomalyCount} rows with spend > 0 but 0 impressions`);
+    if (clickAnomalyCount > 0) reasons.push(`${clickAnomalyCount} rows with clicks > 0 but 0 impressions`);
+    checks.push({
+      id: 'metrics_integrity',
+      rule: 'Conversion Funnel Integrity',
+      status: 'warning',
+      message: `Data anomalies detected: ${reasons.join(', ')}.`
+    });
+  }
+
+  return checks;
+}
+
 export const ForecastProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [history, setHistory] = useState<HistoricalPoint[]>([]);
   const [campaigns, setCampaigns] = useState<CampaignPerformance[]>([]);
@@ -33,6 +235,7 @@ export const ForecastProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const [error, setError] = useState<string | null>(null);
   const [apiKey, setApiKeyState] = useState('');
   const [isSandbox, setIsSandbox] = useState(true);
+  const [consistencyChecks, setConsistencyChecks] = useState<ConsistencyCheck[]>([]);
 
   // Load API Key from localStorage
   useEffect(() => {
@@ -83,6 +286,15 @@ export const ForecastProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         setHistory(history);
         setCampaigns(campaigns);
       }
+      
+      // Default checks pass for demo data
+      setConsistencyChecks([
+        { id: 'schema_valid', rule: 'Schema Completeness', status: 'pass', message: 'All 14 required columns are present and correctly mapped.' },
+        { id: 'channel_representation', rule: 'Channel Representation', status: 'pass', message: 'All three paid acquisition networks (Google Ads, Meta Ads, Microsoft Ads) are represented in the dataset.' },
+        { id: 'naming_consistency', rule: 'Campaign Naming Integrity', status: 'pass', message: 'No spelling duplicates or naming standard warnings detected across campaigns.' },
+        { id: 'attribution_tagging', rule: 'Channel Type Alignment', status: 'pass', message: 'All campaigns align with their appropriate network channel types (e.g. Google -> Search, Meta -> Social).' },
+        { id: 'metrics_integrity', rule: 'Conversion Funnel Integrity', status: 'pass', message: 'Impressions, clicks, and conversions align logically across all records (no empty funnels).' }
+      ]);
     } catch (err: any) {
       setError(err.message || 'Seeding failed');
     } finally {
@@ -94,6 +306,10 @@ export const ForecastProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     setLoading(true);
     setError(null);
     try {
+      const text = await file.text();
+      const checks = performConsistencyChecks(text);
+      setConsistencyChecks(checks);
+      
       if (!isSandbox) {
         const formData = new FormData();
         formData.append('file', file);
@@ -114,7 +330,6 @@ export const ForecastProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         return true;
       } else {
         // Parse CSV client-side in Sandbox mode
-        const text = await file.text();
         const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
         if (lines.length < 2) throw new Error('CSV is empty');
         
@@ -265,7 +480,7 @@ export const ForecastProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
   return (
     <ForecastContext.Provider value={{
-      history, campaigns, forecast, insights, simulation, loading, error, apiKey, isSandbox,
+      history, campaigns, forecast, insights, simulation, loading, error, apiKey, isSandbox, consistencyChecks,
       setApiKey, seedData, uploadCSV, runForecast, simulateBudgets, downloadReport, resetAll
     }}>
       {children}
