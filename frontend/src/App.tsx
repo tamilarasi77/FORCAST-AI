@@ -55,6 +55,13 @@ const DashboardWorkspace: React.FC = () => {
     }
   }, [history]);
 
+  // Automatically execute default forecast run when dataset is loaded
+  useEffect(() => {
+    if (history.length > 0 && !forecast && !loading) {
+      runForecast(period, gBudget, mBudget, msBudget);
+    }
+  }, [history, forecast, loading]);
+
   // Sync simulator sliders with daily averages from forecast or defaults
   useEffect(() => {
     if (forecast) {
